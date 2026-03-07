@@ -52,6 +52,7 @@ type Heap struct {
 	MaxSize int
 	Objects map[int]*Object // Live objects indexed by ID
 	nextID  int
+	Marking bool // True while the GC is in the mark phase
 }
 
 func NewHeap(maxSize int) *Heap {
@@ -73,6 +74,56 @@ func (h *Heap) Alloc() (*Object, error) {
 	h.Objects[obj.ID] = obj
 	h.nextID++
 	return obj, nil
+}
+
+// --- Hybrid Write Barrier ---
+
+// WriteBarrier is called on every pointer store during the mark phase.
+// It implements Go's hybrid barrier: shade BOTH the old target and the
+// new target grey. This closes two holes:
+//   - Deletion barrier (shade old): if a grey object loses its pointer to
+//     a white object, shading the old target ensures the GC still finds it.
+//   - Insertion barrier (shade new): if a black object gains a pointer to
+//     a white object, shading the new target ensures the GC still finds it.
+//
+// When the GC is not in the mark phase, this is a no-op.
+func WriteBarrier(h *Heap, old, new_ *Object) {
+	if !h.Marking {
+		return
+	}
+	if old != nil && old.Color == White {
+		old.Color = Grey
+	}
+	if new_ != nil && new_.Color == White {
+		new_.Color = Grey
+	}
+}
+
+// SetChild is the safe way for mutators to update a pointer during GC.
+// It fires the write barrier before performing the actual write.
+//   src.Children[idx] = new_
+func SetChild(h *Heap, src *Object, idx int, new_ *Object) {
+	var old *Object
+	if idx < len(src.Children) {
+		old = src.Children[idx]
+	}
+	WriteBarrier(h, old, new_)
+	if idx < len(src.Children) {
+		src.Children[idx] = new_
+	}
+}
+
+// ReplaceChildren is the safe way to overwrite an object's entire child
+// list. Fires the barrier for every old child being removed and the new
+// child being added.
+func ReplaceChildren(h *Heap, src *Object, newChildren []*Object) {
+	for _, old := range src.Children {
+		WriteBarrier(h, old, nil)
+	}
+	for _, new_ := range newChildren {
+		WriteBarrier(h, nil, new_)
+	}
+	src.Children = newChildren
 }
 
 // --- Mark-Sweep Collector (stop-the-world) ---
