@@ -9,17 +9,21 @@ import (
 
 // GCStats records what happened during one collection cycle.
 type GCStats struct {
-	Cycle          int
-	HeapBefore     int
-	HeapAfter      int
-	Collected      int
-	STWPause       time.Duration
+	Cycle         int
+	HeapBefore    int
+	HeapAfter     int
+	Collected     int
+	TotalTime     time.Duration // wall-clock time for entire GC cycle
+	STWMarkSetup  time.Duration // STW pause #1: reset colors, enable barrier, shade roots
+	ConcurrentMark time.Duration // concurrent: trace the object graph (mutators run freely)
+	STWSweep      time.Duration // STW pause #2: disable barrier, sweep white objects
 }
 
 func (s GCStats) String() string {
 	return fmt.Sprintf(
-		"[cycle %d] before=%d after=%d collected=%d pause=%s",
-		s.Cycle, s.HeapBefore, s.HeapAfter, s.Collected, s.STWPause,
+		"[cycle %d] before=%d after=%d collected=%d | total=%s stw1=%s mark=%s stw2=%s",
+		s.Cycle, s.HeapBefore, s.HeapAfter, s.Collected,
+		s.TotalTime, s.STWMarkSetup, s.ConcurrentMark, s.STWSweep,
 	)
 }
 
@@ -119,30 +123,28 @@ func RunWithPacer(
 		ch.mu.Unlock()
 
 		if shouldRun {
-			stwStart := time.Now()
+			cycleStart := time.Now()
 
-			ConcurrentMarkSweep(ch, rootIDs)
+			timings := ConcurrentMarkSweep(ch, rootIDs)
 
-			// Snapshot heap size immediately after sweep while still
-			// under lock, to avoid counting mutator allocations as
-			// "surviving" objects.
 			ch.mu.Lock()
 			after := len(ch.Heap.Objects)
 			ch.mu.Unlock()
 
-			stwDur := time.Since(stwStart)
-
 			collected := before - after
 			if collected < 0 {
-				collected = 0 // mutators allocated more than GC freed
+				collected = 0
 			}
 
 			stats := GCStats{
-				Cycle:      cycle,
-				HeapBefore: before,
-				HeapAfter:  after,
-				Collected:  collected,
-				STWPause:   stwDur,
+				Cycle:          cycle,
+				HeapBefore:     before,
+				HeapAfter:      after,
+				Collected:      collected,
+				TotalTime:      time.Since(cycleStart),
+				STWMarkSetup:   timings.STWMarkSetup,
+				ConcurrentMark: timings.ConcurrentMark,
+				STWSweep:       timings.STWSweep,
 			}
 			allStats = append(allStats, stats)
 			if printStats {

@@ -68,21 +68,34 @@ func ConcurrentMarkSweepUnsafe(ch *ConcurrentHeap, rootIDs []int) {
 
 // --- Safe collector (with hybrid write barrier) ---
 
+// GCPhaseTimings records how long each GC phase took.
+type GCPhaseTimings struct {
+	STWMarkSetup   time.Duration // STW pause #1: reset + enable barrier + shade roots
+	ConcurrentMark time.Duration // concurrent mark: trace objects (mutators run freely)
+	STWSweep       time.Duration // STW pause #2: disable barrier + sweep
+}
+
 // ConcurrentMarkSweep runs mark-sweep with the hybrid write barrier
-// enabled during the mark phase. Mutators that call ReplaceChildren /
-// SetChild will fire WriteBarrier, which shades both the old and new
-// targets grey — preventing the lost-object problem from Phase 2.
-func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) {
-	// Phase 1: Reset all objects to white and enable the barrier.
+// enabled during the mark phase. Returns per-phase timings so callers
+// can distinguish true STW pauses from concurrent work.
+//
+// Real Go's GC has the same three-phase structure:
+//   STW #1 → concurrent mark → STW #2
+func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
+	var timings GCPhaseTimings
+
+	// ── STW PAUSE #1: Mark setup ─────────────────────────────────
+	// All mutators are blocked (we hold the lock for the entire block).
+	// In real Go, this is a brief stop-the-world where the runtime:
+	//   - enables the write barrier
+	//   - resets mark state
+	//   - scans goroutine stacks to shade root pointers grey
+	stwStart := time.Now()
 	ch.mu.Lock()
 	for _, obj := range ch.Heap.Objects {
 		obj.Color = White
 	}
-	ch.Heap.Marking = true // barrier is now active
-	ch.mu.Unlock()
-
-	// Phase 2: Shade roots grey.
-	ch.mu.Lock()
+	ch.Heap.Marking = true // write barrier is now active
 	greySet := make([]*Object, 0)
 	for _, id := range rootIDs {
 		if obj, ok := ch.Heap.Objects[id]; ok {
@@ -91,19 +104,19 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) {
 		}
 	}
 	ch.mu.Unlock()
+	timings.STWMarkSetup = time.Since(stwStart)
+	// ── END STW #1 — mutators resume ─────────────────────────────
 
-	// Phase 3: Process grey objects one at a time, releasing the lock
-	// between each to let mutators interleave.
-	//
-	// Key difference from Phase 2: when a mutator rewires a pointer,
-	// the write barrier shades the targets grey. Those grey objects
-	// won't be in our local greySet yet, so each iteration we also
-	// scan the heap for any objects the barrier shaded grey.
+	// ── CONCURRENT MARK ──────────────────────────────────────────
+	// Process grey objects one at a time, releasing the lock between
+	// each to let mutators interleave. This is where the write
+	// barrier earns its keep: mutators can rewire pointers freely,
+	// and the barrier ensures newly-reachable objects are shaded grey.
+	markStart := time.Now()
 	for {
 		ch.mu.Lock()
 
 		// Collect any objects the barrier shaded grey since our last pass.
-		// This is how the GC "learns" about pointer writes it missed.
 		for _, obj := range ch.Heap.Objects {
 			if obj.Color == Grey {
 				alreadyQueued := false
@@ -127,7 +140,6 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) {
 		current := greySet[0]
 		greySet = greySet[1:]
 
-		// Skip if already processed (another path may have turned it black).
 		if current.Color != Grey {
 			ch.mu.Unlock()
 			continue
@@ -142,10 +154,20 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) {
 		current.Color = Black
 		ch.mu.Unlock()
 
+		// Yield to let mutators run — simulates the GC sharing CPU
+		// with the application, just like real Go's concurrent mark.
 		time.Sleep(time.Microsecond)
 	}
+	timings.ConcurrentMark = time.Since(markStart)
+	// ── END CONCURRENT MARK ──────────────────────────────────────
 
-	// Phase 4: Disable the barrier and sweep.
+	// ── STW PAUSE #2: Mark termination + Sweep ───────────────────
+	// All mutators are blocked again. In real Go, this pause:
+	//   - confirms no grey objects remain (mark termination)
+	//   - disables the write barrier
+	//   - initiates sweep (real Go sweeps concurrently too, but
+	//     for clarity we sweep under the lock here)
+	stwStart = time.Now()
 	ch.mu.Lock()
 	ch.Heap.Marking = false
 	for id, obj := range ch.Heap.Objects {
@@ -154,6 +176,10 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) {
 		}
 	}
 	ch.mu.Unlock()
+	timings.STWSweep = time.Since(stwStart)
+	// ── END STW #2 — mutators resume ─────────────────────────────
+
+	return timings
 }
 
 // --- Mutator (with write barrier) ---
