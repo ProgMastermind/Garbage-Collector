@@ -138,13 +138,15 @@ func TestWriteBarrierFixesGC(t *testing.T) {
 // rewritten.
 func TestWriteBarrierShadesTargets(t *testing.T) {
 	h := NewHeap(10)
-	h.Marking = true // barrier active
 
+	// Allocate before marking starts so objects are born white.
 	src, _ := h.Alloc()
 	oldChild, _ := h.Alloc()
 	newChild, _ := h.Alloc()
 
-	// src is black, both children are white.
+	// Now enable marking. src is black (already scanned),
+	// both children are white (not yet discovered).
+	h.Marking = true
 	src.Color = Black
 	src.Children = []*Object{oldChild}
 

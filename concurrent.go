@@ -7,14 +7,32 @@ import (
 )
 
 // ConcurrentHeap wraps a Heap with a mutex so mutators and the GC
-// can share it safely.
+// can share it safely. The GreyQueue is a shared work queue: the
+// write barrier pushes grey objects here, and the GC pops from it.
+// This replaces the O(n) full-heap scan from Phase 3.
 type ConcurrentHeap struct {
-	mu   sync.Mutex
-	Heap *Heap
+	mu        sync.Mutex
+	Heap      *Heap
+	GreyQueue []*Object // shared work queue for barrier-greyed objects
 }
 
 func NewConcurrentHeap(maxSize int) *ConcurrentHeap {
 	return &ConcurrentHeap{Heap: NewHeap(maxSize)}
+}
+
+// PushGrey adds an object to the shared grey work queue.
+// Must be called while ch.mu is held.
+func (ch *ConcurrentHeap) PushGrey(obj *Object) {
+	ch.GreyQueue = append(ch.GreyQueue, obj)
+}
+
+// DrainGrey moves all objects from the shared grey queue into the
+// caller's local work list and resets the queue. Must be called
+// while ch.mu is held.
+func (ch *ConcurrentHeap) DrainGrey() []*Object {
+	drained := ch.GreyQueue
+	ch.GreyQueue = nil
+	return drained
 }
 
 // --- Unsafe collector (no write barrier) — preserved from Phase 2 ---
@@ -96,6 +114,13 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
 		obj.Color = White
 	}
 	ch.Heap.Marking = true // write barrier is now active
+	// Wire up the grey pusher: barrier-greyed objects go directly
+	// into the shared work queue instead of being discovered by
+	// scanning the entire heap. This is O(1) per barrier fire.
+	ch.GreyQueue = nil
+	ch.Heap.GreyPusher = func(obj *Object) {
+		ch.PushGrey(obj)
+	}
 	greySet := make([]*Object, 0)
 	for _, id := range rootIDs {
 		if obj, ok := ch.Heap.Objects[id]; ok {
@@ -109,26 +134,21 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
 
 	// ── CONCURRENT MARK ──────────────────────────────────────────
 	// Process grey objects one at a time, releasing the lock between
-	// each to let mutators interleave. This is where the write
-	// barrier earns its keep: mutators can rewire pointers freely,
-	// and the barrier ensures newly-reachable objects are shaded grey.
+	// each to let mutators interleave. When a mutator's write barrier
+	// shades an object grey, it pushes it directly into ch.GreyQueue.
+	// Each iteration we drain that queue into our local work list —
+	// no full-heap scan needed.
 	markStart := time.Now()
 	for {
 		ch.mu.Lock()
 
-		// Collect any objects the barrier shaded grey since our last pass.
-		for _, obj := range ch.Heap.Objects {
+		// Drain barrier-greyed objects from the shared queue into
+		// our local work list. This is O(k) where k is the number
+		// of barrier fires since the last drain — not O(n) over
+		// the entire heap.
+		for _, obj := range ch.DrainGrey() {
 			if obj.Color == Grey {
-				alreadyQueued := false
-				for _, g := range greySet {
-					if g == obj {
-						alreadyQueued = true
-						break
-					}
-				}
-				if !alreadyQueued {
-					greySet = append(greySet, obj)
-				}
+				greySet = append(greySet, obj)
 			}
 		}
 
@@ -166,10 +186,13 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
 	//   - confirms no grey objects remain (mark termination)
 	//   - disables the write barrier
 	//   - initiates sweep (real Go sweeps concurrently too, but
-	//     for clarity we sweep under the lock here)
+	//     for clarity we sweep under the lock here — Phase 7 will
+	//     make this concurrent)
 	stwStart = time.Now()
 	ch.mu.Lock()
 	ch.Heap.Marking = false
+	ch.Heap.GreyPusher = nil
+	ch.GreyQueue = nil
 	for id, obj := range ch.Heap.Objects {
 		if obj.Color == White {
 			delete(ch.Heap.Objects, id)

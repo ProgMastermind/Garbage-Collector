@@ -49,10 +49,11 @@ func (o *Object) String() string {
 var ErrHeapFull = errors.New("heap is full: cannot allocate")
 
 type Heap struct {
-	MaxSize int
-	Objects map[int]*Object // Live objects indexed by ID
-	nextID  int
-	Marking bool // True while the GC is in the mark phase
+	MaxSize    int
+	Objects    map[int]*Object // Live objects indexed by ID
+	nextID     int
+	Marking    bool               // True while the GC is in the mark phase
+	GreyPusher func(obj *Object)  // If set, called to push grey objects to the shared work queue
 }
 
 func NewHeap(maxSize int) *Heap {
@@ -62,14 +63,21 @@ func NewHeap(maxSize int) *Heap {
 	}
 }
 
-// Alloc creates a new white object on the heap.
+// Alloc creates a new object on the heap. During the mark phase, new
+// objects are born black — they have no outgoing pointers yet, so
+// marking them black is safe and avoids unnecessary barrier work.
+// Outside the mark phase, objects start white (ready for next cycle).
 func (h *Heap) Alloc() (*Object, error) {
 	if len(h.Objects) >= h.MaxSize {
 		return nil, ErrHeapFull
 	}
+	color := White
+	if h.Marking {
+		color = Black // born black: no children to scan
+	}
 	obj := &Object{
 		ID:    h.nextID,
-		Color: White,
+		Color: color,
 	}
 	h.Objects[obj.ID] = obj
 	h.nextID++
@@ -87,15 +95,25 @@ func (h *Heap) Alloc() (*Object, error) {
 //     a white object, shading the new target ensures the GC still finds it.
 //
 // When the GC is not in the mark phase, this is a no-op.
+//
+// When GreyPusher is set (concurrent mode), greyed objects are pushed
+// directly onto the shared work queue — O(1) per barrier fire.
+// The GC drains this queue instead of scanning the entire heap.
 func WriteBarrier(h *Heap, old, new_ *Object) {
 	if !h.Marking {
 		return
 	}
 	if old != nil && old.Color == White {
 		old.Color = Grey
+		if h.GreyPusher != nil {
+			h.GreyPusher(old)
+		}
 	}
 	if new_ != nil && new_.Color == White {
 		new_.Color = Grey
+		if h.GreyPusher != nil {
+			h.GreyPusher(new_)
+		}
 	}
 }
 
