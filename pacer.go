@@ -9,14 +9,14 @@ import (
 
 // GCStats records what happened during one collection cycle.
 type GCStats struct {
-	Cycle         int
-	HeapBefore    int
-	HeapAfter     int
-	Collected     int
-	TotalTime     time.Duration // wall-clock time for entire GC cycle
-	STWMarkSetup  time.Duration // STW pause #1: reset colors, enable barrier, shade roots
+	Cycle          int
+	HeapBefore     int
+	HeapAfter      int
+	Collected      int
+	TotalTime      time.Duration // wall-clock time for entire GC cycle
+	STWMarkSetup   time.Duration // STW pause #1: reset colors, enable barrier, shade roots
 	ConcurrentMark time.Duration // concurrent: trace the object graph (mutators run freely)
-	STWSweep      time.Duration // STW pause #2: disable barrier, sweep white objects
+	STWSweep       time.Duration // STW pause #2: disable barrier, sweep white objects
 }
 
 func (s GCStats) String() string {
@@ -35,9 +35,9 @@ func (s GCStats) String() string {
 // GOGC=100 (default): collect when heap doubles since last GC.
 // GOGC=0: collect constantly (after every allocation batch).
 type Pacer struct {
-	GOGC           int // percentage growth allowed before next GC
+	GOGC            int // percentage growth allowed before next GC
 	liveAfterLastGC int // objects surviving the most recent collection
-	gcCycles       atomic.Int64
+	gcCycles        atomic.Int64
 }
 
 func NewPacer(gogc int) *Pacer {
@@ -70,7 +70,7 @@ func (p *Pacer) Cycles() int {
 
 // RunWithPacer starts mutators and a pacer loop that triggers GC based
 // on heap occupancy. It runs for the given duration, then stops
-// everything and returns the collected stats.
+// everything and returns the collected stats and metrics.
 func RunWithPacer(
 	heapSize int,
 	rootIDs []int,
@@ -78,9 +78,10 @@ func RunWithPacer(
 	gogc int,
 	duration time.Duration,
 	printStats bool,
-) []GCStats {
+) ([]GCStats, *Metrics) {
 	ch := NewConcurrentHeap(heapSize)
 	pacer := NewPacer(gogc)
+	metrics := NewMetrics(heapSize)
 
 	// Pre-create root objects.
 	ch.mu.Lock()
@@ -93,12 +94,12 @@ func RunWithPacer(
 	}
 	ch.mu.Unlock()
 
-	// Start mutators.
+	// Start mutators — pass metrics so they can report allocations.
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	for range numMutators {
 		wg.Add(1)
-		go Mutator(ch, rootIDs, done, &wg)
+		go MutatorWithMetrics(ch, rootIDs, done, &wg, metrics)
 	}
 
 	var allStats []GCStats
@@ -112,7 +113,7 @@ func RunWithPacer(
 		case <-deadline:
 			close(done)
 			wg.Wait()
-			return allStats
+			return allStats, metrics
 		default:
 		}
 
@@ -121,6 +122,9 @@ func RunWithPacer(
 		shouldRun := pacer.ShouldCollect(heapNow)
 		before := heapNow
 		ch.mu.Unlock()
+
+		// Let metrics track peak heap between GC cycles.
+		metrics.ObserveHeapSize(before)
 
 		if shouldRun {
 			cycleStart := time.Now()
@@ -147,6 +151,8 @@ func RunWithPacer(
 				STWSweep:       timings.STWSweep,
 			}
 			allStats = append(allStats, stats)
+			metrics.RecordGCCycle(stats)
+
 			if printStats {
 				fmt.Println(stats)
 			}

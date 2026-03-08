@@ -234,6 +234,50 @@ func Mutator(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{}, wg *sync.W
 	}
 }
 
+// MutatorWithMetrics is Mutator with allocation tracking for Phase 5.
+func MutatorWithMetrics(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{}, wg *sync.WaitGroup, m *Metrics) {
+	defer wg.Done()
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		ch.mu.Lock()
+
+		obj, err := ch.Heap.Alloc()
+		if err == nil {
+			m.RecordAllocation()
+			ids := heapIDs(ch.Heap)
+			if len(ids) > 1 {
+				parentID := ids[rng.Intn(len(ids))]
+				parent := ch.Heap.Objects[parentID]
+				newChildren := make([]*Object, len(parent.Children)+1)
+				copy(newChildren, parent.Children)
+				newChildren[len(parent.Children)] = obj
+				ReplaceChildren(ch.Heap, parent, newChildren)
+			}
+		}
+
+		ids := heapIDs(ch.Heap)
+		if len(ids) >= 2 {
+			srcID := ids[rng.Intn(len(ids))]
+			dstID := ids[rng.Intn(len(ids))]
+			src := ch.Heap.Objects[srcID]
+			dst := ch.Heap.Objects[dstID]
+			if src != dst {
+				ReplaceChildren(ch.Heap, src, []*Object{dst})
+			}
+		}
+
+		ch.mu.Unlock()
+		time.Sleep(time.Duration(rng.Intn(500)) * time.Microsecond)
+	}
+}
+
 // MutatorUnsafe is the Phase 2 mutator — no write barrier.
 func MutatorUnsafe(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
