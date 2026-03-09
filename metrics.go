@@ -14,14 +14,15 @@ type Metrics struct {
 	mu sync.Mutex
 
 	// GC cycle stats
-	gcCycles       int
-	totalSTW1      time.Duration // cumulative STW mark-setup time
-	totalSTW2      time.Duration // cumulative STW sweep time
-	totalMarkTime  time.Duration // cumulative concurrent mark time
-	totalGCTime    time.Duration // cumulative total GC time
-	minSTW         time.Duration // shortest STW pause (either phase)
-	maxSTW         time.Duration // longest STW pause (either phase)
-	stwCount       int           // number of individual STW pauses (2 per cycle)
+	gcCycles        int
+	totalSTW1       time.Duration // cumulative STW mark-setup time
+	totalSTW2       time.Duration // cumulative STW mark-termination time
+	totalMarkTime   time.Duration // cumulative concurrent mark time
+	totalSweepTime  time.Duration // cumulative concurrent sweep time
+	totalGCTime     time.Duration // cumulative total GC time
+	minSTW          time.Duration // shortest STW pause (either phase)
+	maxSTW          time.Duration // longest STW pause (either phase)
+	stwCount        int           // number of individual STW pauses (2 per cycle)
 
 	// Heap stats
 	peakHeapSize int // max heap occupancy seen
@@ -55,8 +56,9 @@ func (m *Metrics) RecordGCCycle(stats GCStats) {
 
 	m.gcCycles++
 	m.totalSTW1 += stats.STWMarkSetup
-	m.totalSTW2 += stats.STWSweep
+	m.totalSTW2 += stats.STWMarkTermination
 	m.totalMarkTime += stats.ConcurrentMark
+	m.totalSweepTime += stats.ConcurrentSweep
 	m.totalGCTime += stats.TotalTime
 
 	if stats.Collected > 0 {
@@ -64,7 +66,7 @@ func (m *Metrics) RecordGCCycle(stats GCStats) {
 	}
 
 	// Track min/max across both STW phases.
-	for _, pause := range []time.Duration{stats.STWMarkSetup, stats.STWSweep} {
+	for _, pause := range []time.Duration{stats.STWMarkSetup, stats.STWMarkTermination} {
 		m.stwCount++
 		if pause < m.minSTW {
 			m.minSTW = pause
@@ -78,7 +80,6 @@ func (m *Metrics) RecordGCCycle(stats GCStats) {
 	if stats.HeapBefore > m.peakHeapSize {
 		m.peakHeapSize = stats.HeapBefore
 	}
-	// Also check after — in case mutators pushed it higher during mark.
 	if stats.HeapAfter > m.peakHeapSize {
 		m.peakHeapSize = stats.HeapAfter
 	}
@@ -129,27 +130,26 @@ func (m *Metrics) Summary(gogc int, duration time.Duration, numMutators int) str
 
 	// STW pauses
 	b.WriteString("  Stop-the-World Pauses\n")
-	b.WriteString(fmt.Sprintf("    Total STW time  : %s\n", m.totalSTW1+m.totalSTW2))
+	totalSTW := m.totalSTW1 + m.totalSTW2
+	b.WriteString(fmt.Sprintf("    Total STW time  : %s\n", totalSTW))
 	b.WriteString(fmt.Sprintf("      mark setup    : %s (across %d pauses)\n", m.totalSTW1, m.gcCycles))
-	b.WriteString(fmt.Sprintf("      sweep         : %s (across %d pauses)\n", m.totalSTW2, m.gcCycles))
+	b.WriteString(fmt.Sprintf("      mark term     : %s (across %d pauses)\n", m.totalSTW2, m.gcCycles))
 	if m.stwCount > 0 {
-		avgSTW := (m.totalSTW1 + m.totalSTW2) / time.Duration(m.stwCount)
+		avgSTW := totalSTW / time.Duration(m.stwCount)
 		b.WriteString(fmt.Sprintf("    Avg STW pause   : %s\n", avgSTW))
 		b.WriteString(fmt.Sprintf("    Min STW pause   : %s\n", m.minSTW))
 		b.WriteString(fmt.Sprintf("    Max STW pause   : %s\n", m.maxSTW))
 	}
 	b.WriteString("\n")
 
-	// Concurrent mark
-	b.WriteString("  Concurrent Mark\n")
-	b.WriteString(fmt.Sprintf("    Total mark time : %s\n", m.totalMarkTime))
-	if m.gcCycles > 0 {
-		avgMark := m.totalMarkTime / time.Duration(m.gcCycles)
-		b.WriteString(fmt.Sprintf("    Avg mark time   : %s\n", avgMark))
-	}
+	// Concurrent work
+	b.WriteString("  Concurrent Work\n")
+	b.WriteString(fmt.Sprintf("    Mark time       : %s\n", m.totalMarkTime))
+	b.WriteString(fmt.Sprintf("    Sweep time      : %s\n", m.totalSweepTime))
+	totalConc := m.totalMarkTime + m.totalSweepTime
 	if m.totalGCTime > 0 {
-		concPct := float64(m.totalMarkTime) / float64(m.totalGCTime) * 100
-		b.WriteString(fmt.Sprintf("    Mark %% of GC    : %.1f%%\n", concPct))
+		concPct := float64(totalConc) / float64(m.totalGCTime) * 100
+		b.WriteString(fmt.Sprintf("    Concurrent %%    : %.1f%% of total GC time\n", concPct))
 	}
 	b.WriteString("\n")
 
@@ -212,3 +212,4 @@ func (m *Metrics) MaxSTW() time.Duration {
 	defer m.mu.Unlock()
 	return m.maxSTW
 }
+

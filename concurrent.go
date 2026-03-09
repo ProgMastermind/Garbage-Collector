@@ -88,9 +88,10 @@ func ConcurrentMarkSweepUnsafe(ch *ConcurrentHeap, rootIDs []int) {
 
 // GCPhaseTimings records how long each GC phase took.
 type GCPhaseTimings struct {
-	STWMarkSetup   time.Duration // STW pause #1: reset + enable barrier + shade roots
-	ConcurrentMark time.Duration // concurrent mark: trace objects (mutators run freely)
-	STWSweep       time.Duration // STW pause #2: disable barrier + sweep
+	STWMarkSetup       time.Duration // STW pause #1: reset + enable barrier + shade roots
+	ConcurrentMark     time.Duration // concurrent mark: trace objects (mutators run freely)
+	STWMarkTermination time.Duration // STW pause #2: disable barrier, build sweep queue
+	ConcurrentSweep    time.Duration // concurrent sweep: free white objects (mutators run freely)
 }
 
 // ConcurrentMarkSweep runs mark-sweep with the hybrid write barrier
@@ -181,26 +182,63 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
 	timings.ConcurrentMark = time.Since(markStart)
 	// ── END CONCURRENT MARK ──────────────────────────────────────
 
-	// ── STW PAUSE #2: Mark termination + Sweep ───────────────────
-	// All mutators are blocked again. In real Go, this pause:
-	//   - confirms no grey objects remain (mark termination)
+	// ── STW PAUSE #2: Mark termination ───────────────────────────
+	// All mutators are blocked briefly. This pause ONLY:
 	//   - disables the write barrier
-	//   - initiates sweep (real Go sweeps concurrently too, but
-	//     for clarity we sweep under the lock here — Phase 7 will
-	//     make this concurrent)
+	//   - builds the sweep queue (list of white object IDs)
+	//   - sets the Sweeping flag
+	// No objects are actually deleted here — that happens concurrently.
+	// In real Go, this pause is typically <100μs.
 	stwStart = time.Now()
 	ch.mu.Lock()
 	ch.Heap.Marking = false
 	ch.Heap.GreyPusher = nil
 	ch.GreyQueue = nil
+	// Build sweep queue: collect IDs of all white objects.
+	ch.Heap.SweepQueue = ch.Heap.SweepQueue[:0]
 	for id, obj := range ch.Heap.Objects {
 		if obj.Color == White {
-			delete(ch.Heap.Objects, id)
+			ch.Heap.SweepQueue = append(ch.Heap.SweepQueue, id)
 		}
 	}
+	ch.Heap.Sweeping = true
 	ch.mu.Unlock()
-	timings.STWSweep = time.Since(stwStart)
+	timings.STWMarkTermination = time.Since(stwStart)
 	// ── END STW #2 — mutators resume ─────────────────────────────
+
+	// ── CONCURRENT SWEEP ─────────────────────────────────────────
+	// Free white objects one batch at a time, releasing the lock
+	// between batches so mutators can interleave. In real Go,
+	// sweeping is even lazier: each goroutine sweeps a span before
+	// allocating from it. We sweep in small batches to approximate
+	// that behavior.
+	sweepStart := time.Now()
+	const sweepBatchSize = 16
+	for {
+		ch.mu.Lock()
+		remaining := len(ch.Heap.SweepQueue)
+		if remaining == 0 {
+			ch.Heap.Sweeping = false
+			ch.mu.Unlock()
+			break
+		}
+		// Sweep up to sweepBatchSize objects per lock acquisition.
+		batchEnd := sweepBatchSize
+		if batchEnd > remaining {
+			batchEnd = remaining
+		}
+		batch := ch.Heap.SweepQueue[:batchEnd]
+		ch.Heap.SweepQueue = ch.Heap.SweepQueue[batchEnd:]
+
+		for _, id := range batch {
+			if obj, ok := ch.Heap.Objects[id]; ok && obj.Color == White {
+				delete(ch.Heap.Objects, id)
+			}
+		}
+		ch.mu.Unlock()
+	}
+	timings.ConcurrentSweep = time.Since(sweepStart)
+	// ── END CONCURRENT SWEEP ─────────────────────────────────────
 
 	return timings
 }

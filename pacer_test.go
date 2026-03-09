@@ -138,14 +138,15 @@ func TestMetricsConcurrentSafety(t *testing.T) {
 				m.RecordAllocation()
 				m.ObserveHeapSize(500)
 				m.RecordGCCycle(GCStats{
-					Cycle:          1,
-					HeapBefore:     400,
-					HeapAfter:      300,
-					Collected:      100,
-					TotalTime:      10 * time.Millisecond,
-					STWMarkSetup:   5 * time.Microsecond,
-					ConcurrentMark: 9 * time.Millisecond,
-					STWSweep:       3 * time.Microsecond,
+					Cycle:              1,
+					HeapBefore:         400,
+					HeapAfter:          300,
+					Collected:          100,
+					TotalTime:          10 * time.Millisecond,
+					STWMarkSetup:       5 * time.Microsecond,
+					ConcurrentMark:     9 * time.Millisecond,
+					STWMarkTermination: 3 * time.Microsecond,
+					ConcurrentSweep:    500 * time.Microsecond,
 				})
 			}
 		}()

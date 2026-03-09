@@ -9,21 +9,23 @@ import (
 
 // GCStats records what happened during one collection cycle.
 type GCStats struct {
-	Cycle          int
-	HeapBefore     int
-	HeapAfter      int
-	Collected      int
-	TotalTime      time.Duration // wall-clock time for entire GC cycle
-	STWMarkSetup   time.Duration // STW pause #1: reset colors, enable barrier, shade roots
-	ConcurrentMark time.Duration // concurrent: trace the object graph (mutators run freely)
-	STWSweep       time.Duration // STW pause #2: disable barrier, sweep white objects
+	Cycle              int
+	HeapBefore         int
+	HeapAfter          int
+	Collected          int
+	TotalTime          time.Duration // wall-clock time for entire GC cycle
+	STWMarkSetup       time.Duration // STW pause #1: reset colors, enable barrier, shade roots
+	ConcurrentMark     time.Duration // concurrent: trace the object graph (mutators run freely)
+	STWMarkTermination time.Duration // STW pause #2: disable barrier, build sweep queue
+	ConcurrentSweep    time.Duration // concurrent: free white objects (mutators run freely)
 }
 
 func (s GCStats) String() string {
 	return fmt.Sprintf(
-		"[cycle %d] before=%d after=%d collected=%d | total=%s stw1=%s mark=%s stw2=%s",
+		"[cycle %d] before=%d after=%d collected=%d | total=%s stw1=%s mark=%s stw2=%s sweep=%s",
 		s.Cycle, s.HeapBefore, s.HeapAfter, s.Collected,
-		s.TotalTime, s.STWMarkSetup, s.ConcurrentMark, s.STWSweep,
+		s.TotalTime, s.STWMarkSetup, s.ConcurrentMark,
+		s.STWMarkTermination, s.ConcurrentSweep,
 	)
 }
 
@@ -141,14 +143,15 @@ func RunWithPacer(
 			}
 
 			stats := GCStats{
-				Cycle:          cycle,
-				HeapBefore:     before,
-				HeapAfter:      after,
-				Collected:      collected,
-				TotalTime:      time.Since(cycleStart),
-				STWMarkSetup:   timings.STWMarkSetup,
-				ConcurrentMark: timings.ConcurrentMark,
-				STWSweep:       timings.STWSweep,
+				Cycle:              cycle,
+				HeapBefore:         before,
+				HeapAfter:          after,
+				Collected:          collected,
+				TotalTime:          time.Since(cycleStart),
+				STWMarkSetup:       timings.STWMarkSetup,
+				ConcurrentMark:     timings.ConcurrentMark,
+				STWMarkTermination: timings.STWMarkTermination,
+				ConcurrentSweep:    timings.ConcurrentSweep,
 			}
 			allStats = append(allStats, stats)
 			metrics.RecordGCCycle(stats)
@@ -164,3 +167,4 @@ func RunWithPacer(
 		time.Sleep(50 * time.Microsecond)
 	}
 }
+

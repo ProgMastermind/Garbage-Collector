@@ -53,6 +53,8 @@ type Heap struct {
 	Objects    map[int]*Object // Live objects indexed by ID
 	nextID     int
 	Marking    bool               // True while the GC is in the mark phase
+	Sweeping   bool               // True while concurrent sweep is in progress
+	SweepQueue []int              // IDs of white objects to sweep (populated at mark termination)
 	GreyPusher func(obj *Object)  // If set, called to push grey objects to the shared work queue
 }
 
