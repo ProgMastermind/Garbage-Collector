@@ -24,6 +24,10 @@ type Metrics struct {
 	maxSTW          time.Duration // longest STW pause (either phase)
 	stwCount        int           // number of individual STW pauses (2 per cycle)
 
+	// Stack scanning stats
+	stacksScanned int // total goroutine stacks scanned across all cycles
+	rootsFound    int // total root pointers found from stack scans
+
 	// Heap stats
 	peakHeapSize int // max heap occupancy seen
 	heapCapacity int // max allowed objects
@@ -46,6 +50,15 @@ func NewMetrics(heapCapacity int) *Metrics {
 // RecordAllocation is called by mutators after each successful Alloc.
 func (m *Metrics) RecordAllocation() {
 	m.totalAllocated.Add(1)
+}
+
+// RecordStackScan records the result of scanning goroutine stacks
+// during STW #1.
+func (m *Metrics) RecordStackScan(numStacks, numRoots int) {
+	m.mu.Lock()
+	m.stacksScanned += numStacks
+	m.rootsFound += numRoots
+	m.mu.Unlock()
 }
 
 // RecordGCCycle is called after each completed GC cycle with the
@@ -127,6 +140,17 @@ func (m *Metrics) Summary(gogc int, duration time.Duration, numMutators int) str
 		b.WriteString(fmt.Sprintf("    Avg cycle time  : %s\n", avgTotal))
 	}
 	b.WriteString("\n")
+
+	// Stack scanning
+	if m.stacksScanned > 0 {
+		b.WriteString("  Stack Scanning\n")
+		b.WriteString(fmt.Sprintf("    Stacks scanned  : %d (across %d cycles)\n", m.stacksScanned, m.gcCycles))
+		b.WriteString(fmt.Sprintf("    Roots found     : %d\n", m.rootsFound))
+		if m.gcCycles > 0 {
+			b.WriteString(fmt.Sprintf("    Avg roots/cycle : %d\n", m.rootsFound/m.gcCycles))
+		}
+		b.WriteString("\n")
+	}
 
 	// STW pauses
 	b.WriteString("  Stop-the-World Pauses\n")

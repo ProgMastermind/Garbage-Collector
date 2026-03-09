@@ -154,6 +154,7 @@ func RunWithPacer(
 				ConcurrentSweep:    timings.ConcurrentSweep,
 			}
 			allStats = append(allStats, stats)
+			metrics.RecordStackScan(timings.StacksScanned, timings.RootsFromStacks)
 			metrics.RecordGCCycle(stats)
 
 			if printStats {

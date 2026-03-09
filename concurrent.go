@@ -6,18 +6,74 @@ import (
 	"time"
 )
 
+// GoroutineStack simulates a goroutine's stack frame — the set of
+// local variables (object pointers) that a goroutine currently holds.
+// In real Go, the GC scans each goroutine's stack during STW #1 to
+// discover root pointers. Our simulation mirrors this: each mutator
+// maintains a stack of object references, and the GC scans all
+// registered stacks to find roots.
+type GoroutineStack struct {
+	ID     int       // goroutine identifier
+	Locals []*Object // simulated local variables pointing into the heap
+}
+
 // ConcurrentHeap wraps a Heap with a mutex so mutators and the GC
 // can share it safely. The GreyQueue is a shared work queue: the
 // write barrier pushes grey objects here, and the GC pops from it.
 // This replaces the O(n) full-heap scan from Phase 3.
+//
+// Stacks holds all registered goroutine stacks. During STW #1, the
+// GC scans every stack to discover root pointers — just like real Go.
 type ConcurrentHeap struct {
 	mu        sync.Mutex
 	Heap      *Heap
-	GreyQueue []*Object // shared work queue for barrier-greyed objects
+	GreyQueue []*Object          // shared work queue for barrier-greyed objects
+	Stacks    map[int]*GoroutineStack // registered goroutine stacks (goroutine ID → stack)
+	nextGID   int                     // next goroutine ID to assign
 }
 
 func NewConcurrentHeap(maxSize int) *ConcurrentHeap {
-	return &ConcurrentHeap{Heap: NewHeap(maxSize)}
+	return &ConcurrentHeap{
+		Heap:   NewHeap(maxSize),
+		Stacks: make(map[int]*GoroutineStack),
+	}
+}
+
+// RegisterStack creates a new goroutine stack and returns it.
+// The mutator owns the returned stack and updates its Locals as it runs.
+// Must be called while ch.mu is held.
+func (ch *ConcurrentHeap) RegisterStack() *GoroutineStack {
+	gs := &GoroutineStack{ID: ch.nextGID}
+	ch.Stacks[gs.ID] = gs
+	ch.nextGID++
+	return gs
+}
+
+// UnregisterStack removes a goroutine stack when the mutator exits.
+// Must be called while ch.mu is held.
+func (ch *ConcurrentHeap) UnregisterStack(gs *GoroutineStack) {
+	delete(ch.Stacks, gs.ID)
+}
+
+// ScanStacks walks all registered goroutine stacks and returns every
+// unique object found. This is the root discovery phase — equivalent
+// to real Go's stack scanning during STW #1.
+// Must be called while ch.mu is held.
+func (ch *ConcurrentHeap) ScanStacks() []*Object {
+	seen := make(map[int]bool)
+	var roots []*Object
+	for _, gs := range ch.Stacks {
+		for _, obj := range gs.Locals {
+			if obj != nil && !seen[obj.ID] {
+				// Only include objects that still exist on the heap.
+				if _, alive := ch.Heap.Objects[obj.ID]; alive {
+					seen[obj.ID] = true
+					roots = append(roots, obj)
+				}
+			}
+		}
+	}
+	return roots
 }
 
 // PushGrey adds an object to the shared grey work queue.
@@ -92,6 +148,8 @@ type GCPhaseTimings struct {
 	ConcurrentMark     time.Duration // concurrent mark: trace objects (mutators run freely)
 	STWMarkTermination time.Duration // STW pause #2: disable barrier, build sweep queue
 	ConcurrentSweep    time.Duration // concurrent sweep: free white objects (mutators run freely)
+	StacksScanned      int           // number of goroutine stacks scanned during STW #1
+	RootsFromStacks    int           // number of root pointers found from stack scanning
 }
 
 // ConcurrentMarkSweep runs mark-sweep with the hybrid write barrier
@@ -122,11 +180,31 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
 	ch.Heap.GreyPusher = func(obj *Object) {
 		ch.PushGrey(obj)
 	}
+
+	// Root discovery: scan all goroutine stacks to find root pointers.
+	// If stacks are registered, they ARE the roots — just like real Go.
+	// Fall back to rootIDs for backward compatibility with older tests.
 	greySet := make([]*Object, 0)
-	for _, id := range rootIDs {
-		if obj, ok := ch.Heap.Objects[id]; ok {
+	if len(ch.Stacks) > 0 {
+		// Stack scanning: walk every goroutine's local variables.
+		// Each pointer on the stack that points to a live heap object
+		// becomes a root. This is exactly what real Go does during
+		// STW #1 — it pauses goroutines and scans their stack frames
+		// for pointers into the heap.
+		timings.StacksScanned = len(ch.Stacks)
+		stackRoots := ch.ScanStacks()
+		timings.RootsFromStacks = len(stackRoots)
+		for _, obj := range stackRoots {
 			obj.Color = Grey
 			greySet = append(greySet, obj)
+		}
+	} else {
+		// Legacy path: use hardcoded root IDs (pre-Phase 8 tests).
+		for _, id := range rootIDs {
+			if obj, ok := ch.Heap.Objects[id]; ok {
+				obj.Color = Grey
+				greySet = append(greySet, obj)
+			}
 		}
 	}
 	ch.mu.Unlock()
@@ -248,9 +326,31 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
 // Mutator simulates a running goroutine that continuously allocates and
 // rewires pointers. Uses ReplaceChildren so the write barrier fires on
 // every pointer store.
+//
+// Each mutator registers a goroutine stack with the ConcurrentHeap. As
+// it allocates and works with objects, it maintains local references on
+// its stack — just like a real goroutine holds pointers in local vars.
+// During STW #1, the GC scans these stacks to discover root pointers.
 func Mutator(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// Register this goroutine's stack. Seed it with the root objects
+	// so the GC can find them via stack scanning.
+	ch.mu.Lock()
+	stack := ch.RegisterStack()
+	for _, id := range rootIDs {
+		if obj, ok := ch.Heap.Objects[id]; ok {
+			stack.Locals = append(stack.Locals, obj)
+		}
+	}
+	ch.mu.Unlock()
+
+	defer func() {
+		ch.mu.Lock()
+		ch.UnregisterStack(stack)
+		ch.mu.Unlock()
+	}()
 
 	for {
 		select {
@@ -264,6 +364,9 @@ func Mutator(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{}, wg *sync.W
 		// Allocate a new object if there's room.
 		obj, err := ch.Heap.Alloc()
 		if err == nil {
+			// The new object is a local variable on our stack.
+			stack.Locals = append(stack.Locals, obj)
+
 			ids := heapIDs(ch.Heap)
 			if len(ids) > 1 {
 				parentID := ids[rng.Intn(len(ids))]
@@ -290,6 +393,20 @@ func Mutator(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{}, wg *sync.W
 			}
 		}
 
+		// Simulate stack frame churn: occasionally drop old locals and
+		// pick up new references — models function returns and new
+		// local variable assignments. This is critical because it means
+		// roots change between GC cycles, just like in a real program.
+		if len(stack.Locals) > 5 && rng.Intn(3) == 0 {
+			// Drop the oldest local (function returned, var went out of scope).
+			stack.Locals = stack.Locals[1:]
+		}
+		if len(ids) > 0 && rng.Intn(4) == 0 {
+			// Pick up a reference to an existing object (new local variable).
+			randomID := ids[rng.Intn(len(ids))]
+			stack.Locals = append(stack.Locals, ch.Heap.Objects[randomID])
+		}
+
 		ch.mu.Unlock()
 		time.Sleep(time.Duration(rng.Intn(500)) * time.Microsecond)
 	}
@@ -299,6 +416,21 @@ func Mutator(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{}, wg *sync.W
 func MutatorWithMetrics(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{}, wg *sync.WaitGroup, m *Metrics) {
 	defer wg.Done()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	ch.mu.Lock()
+	stack := ch.RegisterStack()
+	for _, id := range rootIDs {
+		if obj, ok := ch.Heap.Objects[id]; ok {
+			stack.Locals = append(stack.Locals, obj)
+		}
+	}
+	ch.mu.Unlock()
+
+	defer func() {
+		ch.mu.Lock()
+		ch.UnregisterStack(stack)
+		ch.mu.Unlock()
+	}()
 
 	for {
 		select {
@@ -312,6 +444,8 @@ func MutatorWithMetrics(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{},
 		obj, err := ch.Heap.Alloc()
 		if err == nil {
 			m.RecordAllocation()
+			stack.Locals = append(stack.Locals, obj)
+
 			ids := heapIDs(ch.Heap)
 			if len(ids) > 1 {
 				parentID := ids[rng.Intn(len(ids))]
@@ -332,6 +466,15 @@ func MutatorWithMetrics(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{},
 			if src != dst {
 				ReplaceChildren(ch.Heap, src, []*Object{dst})
 			}
+		}
+
+		// Stack frame churn: drop old locals, pick up new references.
+		if len(stack.Locals) > 5 && rng.Intn(3) == 0 {
+			stack.Locals = stack.Locals[1:]
+		}
+		if len(ids) > 0 && rng.Intn(4) == 0 {
+			randomID := ids[rng.Intn(len(ids))]
+			stack.Locals = append(stack.Locals, ch.Heap.Objects[randomID])
 		}
 
 		ch.mu.Unlock()

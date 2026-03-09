@@ -248,6 +248,149 @@ func TestStressConcurrentGCWithBarrier(t *testing.T) {
 	}
 }
 
+// --- Phase 8 tests ---
+
+// TestStackScanningDiscoversRoots verifies that the GC discovers root
+// objects by scanning goroutine stacks rather than using hardcoded IDs.
+func TestStackScanningDiscoversRoots(t *testing.T) {
+	ch := NewConcurrentHeap(20)
+
+	// Allocate objects and build a graph: root → child → grandchild.
+	ch.mu.Lock()
+	root, _ := ch.Heap.Alloc()
+	child, _ := ch.Heap.Alloc()
+	grandchild, _ := ch.Heap.Alloc()
+	garbage1, _ := ch.Heap.Alloc()
+	garbage2, _ := ch.Heap.Alloc()
+
+	root.Children = []*Object{child}
+	child.Children = []*Object{grandchild}
+	// garbage1 and garbage2 have no references from any stack.
+
+	// Register a goroutine stack that holds only the root object.
+	stack := ch.RegisterStack()
+	stack.Locals = []*Object{root}
+	ch.mu.Unlock()
+
+	// Run GC — it should scan the stack, find root, trace to child
+	// and grandchild, and sweep garbage1 and garbage2.
+	ConcurrentMarkSweep(ch, nil) // pass nil rootIDs — stacks are the roots now
+
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
+	// root, child, grandchild must survive.
+	for _, obj := range []*Object{root, child, grandchild} {
+		if _, ok := ch.Heap.Objects[obj.ID]; !ok {
+			t.Errorf("reachable object %d (reachable via stack) was collected", obj.ID)
+		}
+	}
+	// garbage1 and garbage2 must be collected.
+	for _, obj := range []*Object{garbage1, garbage2} {
+		if _, ok := ch.Heap.Objects[obj.ID]; ok {
+			t.Errorf("unreachable object %d survived collection", obj.ID)
+		}
+	}
+}
+
+// TestMultipleStacksMultipleRoots verifies that objects held on different
+// goroutine stacks are all treated as roots.
+func TestMultipleStacksMultipleRoots(t *testing.T) {
+	ch := NewConcurrentHeap(20)
+
+	ch.mu.Lock()
+	objA, _ := ch.Heap.Alloc()
+	objB, _ := ch.Heap.Alloc()
+	childOfA, _ := ch.Heap.Alloc()
+	childOfB, _ := ch.Heap.Alloc()
+	garbage, _ := ch.Heap.Alloc()
+
+	objA.Children = []*Object{childOfA}
+	objB.Children = []*Object{childOfB}
+
+	// Two goroutines, each holding different roots.
+	stack1 := ch.RegisterStack()
+	stack1.Locals = []*Object{objA}
+	stack2 := ch.RegisterStack()
+	stack2.Locals = []*Object{objB}
+	ch.mu.Unlock()
+
+	ConcurrentMarkSweep(ch, nil)
+
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
+	// Everything reachable from either stack must survive.
+	for _, obj := range []*Object{objA, objB, childOfA, childOfB} {
+		if _, ok := ch.Heap.Objects[obj.ID]; !ok {
+			t.Errorf("object %d reachable from a goroutine stack was collected", obj.ID)
+		}
+	}
+	if _, ok := ch.Heap.Objects[garbage.ID]; ok {
+		t.Errorf("garbage object %d survived collection", garbage.ID)
+	}
+}
+
+// TestStackChurnDuringGC runs mutators that actively modify their stacks
+// while GC runs concurrently, verifying no reachable object is lost.
+func TestStackChurnDuringGC(t *testing.T) {
+	const (
+		heapSize    = 80
+		numMutators = 4
+		iterations  = 200
+	)
+	rootIDs := []int{0, 1, 2}
+
+	for iter := range iterations {
+		ch := NewConcurrentHeap(heapSize)
+
+		ch.mu.Lock()
+		for _, id := range rootIDs {
+			obj := &Object{ID: id, Color: White}
+			ch.Heap.Objects[id] = obj
+			if id >= ch.Heap.nextID {
+				ch.Heap.nextID = id + 1
+			}
+		}
+		// Seed some children.
+		for range 10 {
+			obj, _ := ch.Heap.Alloc()
+			if obj != nil {
+				root := ch.Heap.Objects[rootIDs[iter%len(rootIDs)]]
+				ReplaceChildren(ch.Heap, root, append(root.Children, obj))
+			}
+		}
+		ch.mu.Unlock()
+
+		done := make(chan struct{})
+		var wg sync.WaitGroup
+		for range numMutators {
+			wg.Add(1)
+			go Mutator(ch, rootIDs, done, &wg) // registers stack internally
+		}
+
+		ConcurrentMarkSweep(ch, rootIDs)
+
+		close(done)
+		wg.Wait()
+
+		ch.mu.Lock()
+		reachable := walkRoots(ch.Heap, rootIDs)
+		for obj := range reachable {
+			if _, alive := ch.Heap.Objects[obj.ID]; !alive {
+				chain := findPathFromRoots(ch.Heap, rootIDs, obj)
+				ch.mu.Unlock()
+				t.Fatalf(
+					"ITERATION %d: reachable object %d swept with stack scanning!\n"+
+						"  Path: %s",
+					iter, obj.ID, formatPath(chain),
+				)
+			}
+		}
+		ch.mu.Unlock()
+	}
+}
+
 // --- Helpers (shared across Phase 2 and Phase 3 tests) ---
 
 func walkRoots(h *Heap, rootIDs []int) map[*Object]bool {
