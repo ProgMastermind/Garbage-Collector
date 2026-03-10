@@ -28,6 +28,10 @@ type Metrics struct {
 	stacksScanned int // total goroutine stacks scanned across all cycles
 	rootsFound    int // total root pointers found from stack scans
 
+	// GC assist stats
+	totalAssists    int64 // total number of assist events (mutator had to help)
+	totalAssistWork int64 // total grey objects marked by mutators via assist
+
 	// Heap stats
 	peakHeapSize int // max heap occupancy seen
 	heapCapacity int // max allowed objects
@@ -50,6 +54,16 @@ func NewMetrics(heapCapacity int) *Metrics {
 // RecordAllocation is called by mutators after each successful Alloc.
 func (m *Metrics) RecordAllocation() {
 	m.totalAllocated.Add(1)
+}
+
+// RecordAssist is called by a mutator when it was forced to do
+// marking work before allocating (GC assist). objectsMarked is the
+// number of grey objects the mutator marked black.
+func (m *Metrics) RecordAssist(objectsMarked int) {
+	m.mu.Lock()
+	m.totalAssists++
+	m.totalAssistWork += int64(objectsMarked)
+	m.mu.Unlock()
 }
 
 // RecordStackScan records the result of scanning goroutine stacks
@@ -148,6 +162,18 @@ func (m *Metrics) Summary(gogc int, duration time.Duration, numMutators int) str
 		b.WriteString(fmt.Sprintf("    Roots found     : %d\n", m.rootsFound))
 		if m.gcCycles > 0 {
 			b.WriteString(fmt.Sprintf("    Avg roots/cycle : %d\n", m.rootsFound/m.gcCycles))
+		}
+		b.WriteString("\n")
+	}
+
+	// GC assist
+	if m.totalAssists > 0 {
+		b.WriteString("  GC Assist\n")
+		b.WriteString(fmt.Sprintf("    Assist events   : %d\n", m.totalAssists))
+		b.WriteString(fmt.Sprintf("    Objects marked  : %d (by mutators, not GC)\n", m.totalAssistWork))
+		if m.totalAssists > 0 {
+			b.WriteString(fmt.Sprintf("    Avg work/assist : %.1f objects\n",
+				float64(m.totalAssistWork)/float64(m.totalAssists)))
 		}
 		b.WriteString("\n")
 	}

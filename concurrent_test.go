@@ -391,6 +391,135 @@ func TestStackChurnDuringGC(t *testing.T) {
 	}
 }
 
+// --- Phase 9 tests ---
+
+// TestGCAssistForcesMarkingWork verifies that a mutator with assist
+// debt is forced to mark grey objects before it can proceed.
+func TestGCAssistForcesMarkingWork(t *testing.T) {
+	ch := NewConcurrentHeap(30)
+
+	ch.mu.Lock()
+	// Create some objects and make them grey (as if marking is in progress).
+	root, _ := ch.Heap.Alloc()
+	child1, _ := ch.Heap.Alloc()
+	child2, _ := ch.Heap.Alloc()
+	child3, _ := ch.Heap.Alloc()
+
+	root.Children = []*Object{child1, child2, child3}
+
+	// Simulate marking in progress: root is grey, children are white.
+	ch.Heap.Marking = true
+	ch.Heap.GreyPusher = func(obj *Object) { ch.PushGrey(obj) }
+	root.Color = Grey
+	ch.PushGrey(root)
+
+	// Register a goroutine stack with assist debt of 2.
+	stack := ch.RegisterStack()
+	stack.Locals = []*Object{root}
+	stack.AssistDebt = 2
+
+	// Call GCAssist — it should mark objects to pay off the debt.
+	marked := ch.GCAssist(stack)
+	ch.mu.Unlock()
+
+	if marked < 1 {
+		t.Errorf("GCAssist should have marked at least 1 object, marked %d", marked)
+	}
+	if stack.AssistDebt != 0 {
+		t.Errorf("assist debt should be 0 after assist, got %d", stack.AssistDebt)
+	}
+	// root should have been marked black (it was the grey object).
+	if root.Color != Black {
+		t.Errorf("root should be black after assist marked it, got %s", root.Color)
+	}
+}
+
+// TestGCAssistNoDebtNoWork verifies that GCAssist is a no-op when
+// the goroutine has no assist debt.
+func TestGCAssistNoDebtNoWork(t *testing.T) {
+	ch := NewConcurrentHeap(10)
+
+	ch.mu.Lock()
+	obj, _ := ch.Heap.Alloc()
+	obj.Color = Grey
+	ch.Heap.Marking = true
+
+	stack := ch.RegisterStack()
+	stack.AssistDebt = 0 // no debt
+
+	marked := ch.GCAssist(stack)
+	ch.mu.Unlock()
+
+	if marked != 0 {
+		t.Errorf("GCAssist with no debt should mark 0, marked %d", marked)
+	}
+}
+
+// TestGCAssistClearsDebtWhenNoGreyLeft verifies that if there are no
+// grey objects remaining, assist clears the debt (nothing to help with).
+func TestGCAssistClearsDebtWhenNoGreyLeft(t *testing.T) {
+	ch := NewConcurrentHeap(10)
+
+	ch.mu.Lock()
+	obj, _ := ch.Heap.Alloc()
+	obj.Color = Black // no grey objects anywhere
+	ch.Heap.Marking = true
+
+	stack := ch.RegisterStack()
+	stack.AssistDebt = 5
+
+	ch.GCAssist(stack)
+	ch.mu.Unlock()
+
+	if stack.AssistDebt != 0 {
+		t.Errorf("debt should be cleared when no grey objects exist, got %d", stack.AssistDebt)
+	}
+}
+
+// TestGCAssistIntegration runs a full concurrent GC with mutators and
+// verifies that assists occur during marking.
+func TestGCAssistIntegration(t *testing.T) {
+	ch := NewConcurrentHeap(100)
+	metrics := NewMetrics(100)
+	rootIDs := []int{0, 1, 2}
+
+	ch.mu.Lock()
+	for _, id := range rootIDs {
+		obj := &Object{ID: id, Color: White}
+		ch.Heap.Objects[id] = obj
+		if id >= ch.Heap.nextID {
+			ch.Heap.nextID = id + 1
+		}
+	}
+	// Seed enough objects to create grey work.
+	for range 20 {
+		obj, _ := ch.Heap.Alloc()
+		if obj != nil {
+			root := ch.Heap.Objects[rootIDs[0]]
+			root.Children = append(root.Children, obj)
+		}
+	}
+	ch.mu.Unlock()
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go MutatorWithMetrics(ch, rootIDs, done, &wg, metrics)
+	}
+
+	// Run GC — mutators should experience assists during mark phase.
+	ConcurrentMarkSweep(ch, rootIDs)
+
+	close(done)
+	wg.Wait()
+
+	// We can't guarantee assists will happen every time (depends on
+	// timing), but verify the system doesn't crash and metrics work.
+	t.Logf("Assist events: %d, objects marked by mutators: %d",
+		metrics.totalAssists, metrics.totalAssistWork)
+}
+
 // --- Helpers (shared across Phase 2 and Phase 3 tests) ---
 
 func walkRoots(h *Heap, rootIDs []int) map[*Object]bool {

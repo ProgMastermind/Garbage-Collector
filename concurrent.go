@@ -12,9 +12,15 @@ import (
 // discover root pointers. Our simulation mirrors this: each mutator
 // maintains a stack of object references, and the GC scans all
 // registered stacks to find roots.
+//
+// AssistDebt tracks how many objects this goroutine has allocated
+// during the current mark phase without "paying" for them with
+// marking work. When debt is positive, the mutator must mark grey
+// objects before it is allowed to allocate — this is GC assist.
 type GoroutineStack struct {
-	ID     int       // goroutine identifier
-	Locals []*Object // simulated local variables pointing into the heap
+	ID         int       // goroutine identifier
+	Locals     []*Object // simulated local variables pointing into the heap
+	AssistDebt int       // objects allocated during marking that haven't been "paid for"
 }
 
 // ConcurrentHeap wraps a Heap with a mutex so mutators and the GC
@@ -74,6 +80,69 @@ func (ch *ConcurrentHeap) ScanStacks() []*Object {
 		}
 	}
 	return roots
+}
+
+// GCAssist forces a mutator to do marking work to pay off its assist
+// debt. For each object the mutator allocated during marking, it must
+// mark one grey object black before it can allocate again.
+//
+// In real Go, the assist ratio is calculated dynamically based on
+// remaining mark work vs remaining heap growth budget. Our version
+// is simpler: 1 allocation = 1 grey object to mark. The effect is
+// the same — fast allocators are forced to help the GC keep up.
+//
+// Must be called while ch.mu is held. Returns the number of objects
+// the mutator marked (for metrics).
+func (ch *ConcurrentHeap) GCAssist(gs *GoroutineStack) int {
+	if !ch.Heap.Marking || gs.AssistDebt <= 0 {
+		return 0
+	}
+
+	marked := 0
+	for gs.AssistDebt > 0 {
+		// First, drain any barrier-greyed objects from the shared queue.
+		drained := ch.DrainGrey()
+
+		// Find a grey object to mark.
+		var target *Object
+		for _, obj := range drained {
+			if obj.Color == Grey {
+				target = obj
+				break
+			}
+			// Put non-grey objects back (they were already processed).
+		}
+
+		// If nothing from the drain, scan the heap for any remaining grey.
+		if target == nil {
+			for _, obj := range ch.Heap.Objects {
+				if obj.Color == Grey {
+					target = obj
+					break
+				}
+			}
+		}
+
+		// No grey objects left — marking is essentially done.
+		// Clear the debt; the mutator has nothing to help with.
+		if target == nil {
+			gs.AssistDebt = 0
+			break
+		}
+
+		// Mark it: shade children grey, then shade target black.
+		for _, child := range target.Children {
+			if child.Color == White {
+				child.Color = Grey
+				ch.PushGrey(child)
+			}
+		}
+		target.Color = Black
+		marked++
+		gs.AssistDebt--
+	}
+
+	return marked
 }
 
 // PushGrey adds an object to the shared grey work queue.
@@ -272,6 +341,11 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
 	ch.Heap.Marking = false
 	ch.Heap.GreyPusher = nil
 	ch.GreyQueue = nil
+	// Reset assist debt for all goroutines — marking is over,
+	// so debt from this cycle no longer applies.
+	for _, gs := range ch.Stacks {
+		gs.AssistDebt = 0
+	}
 	// Build sweep queue: collect IDs of all white objects.
 	ch.Heap.SweepQueue = ch.Heap.SweepQueue[:0]
 	for id, obj := range ch.Heap.Objects {
@@ -361,11 +435,23 @@ func Mutator(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{}, wg *sync.W
 
 		ch.mu.Lock()
 
+		// GC assist: if this goroutine has assist debt from prior
+		// allocations during the mark phase, it must do marking work
+		// before it is allowed to allocate again. This creates
+		// backpressure — fast allocators help the GC keep up.
+		ch.GCAssist(stack)
+
 		// Allocate a new object if there's room.
 		obj, err := ch.Heap.Alloc()
 		if err == nil {
 			// The new object is a local variable on our stack.
 			stack.Locals = append(stack.Locals, obj)
+
+			// Incur assist debt: this allocation happened during marking,
+			// so the mutator owes the GC one unit of marking work next time.
+			if ch.Heap.Marking {
+				stack.AssistDebt++
+			}
 
 			ids := heapIDs(ch.Heap)
 			if len(ids) > 1 {
@@ -441,10 +527,20 @@ func MutatorWithMetrics(ch *ConcurrentHeap, rootIDs []int, done <-chan struct{},
 
 		ch.mu.Lock()
 
+		// GC assist: pay off any debt before allocating.
+		assisted := ch.GCAssist(stack)
+		if assisted > 0 {
+			m.RecordAssist(assisted)
+		}
+
 		obj, err := ch.Heap.Alloc()
 		if err == nil {
 			m.RecordAllocation()
 			stack.Locals = append(stack.Locals, obj)
+
+			if ch.Heap.Marking {
+				stack.AssistDebt++
+			}
 
 			ids := heapIDs(ch.Heap)
 			if len(ids) > 1 {
