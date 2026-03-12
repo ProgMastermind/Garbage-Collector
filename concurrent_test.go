@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// --- Phase 2 test (preserved): should still FAIL ---
-
 // TestConcurrentMutatorBreaksGC demonstrates that concurrent mutation
 // WITHOUT a write barrier violates the tri-color invariant.
 // This test SHOULD FAIL.
@@ -69,8 +67,6 @@ func TestConcurrentMutatorBreaksGC(t *testing.T) {
 		ch.mu.Unlock()
 	}
 }
-
-// --- Phase 3 tests ---
 
 // TestWriteBarrierFixesGC is the fixed version of TestConcurrentMutatorBreaksGC.
 // With the hybrid write barrier enabled, no reachable object should be swept.
@@ -248,8 +244,6 @@ func TestStressConcurrentGCWithBarrier(t *testing.T) {
 	}
 }
 
-// --- Phase 8 tests ---
-
 // TestStackScanningDiscoversRoots verifies that the GC discovers root
 // objects by scanning goroutine stacks rather than using hardcoded IDs.
 func TestStackScanningDiscoversRoots(t *testing.T) {
@@ -388,8 +382,6 @@ func TestStackChurnDuringGC(t *testing.T) {
 	}
 }
 
-// --- Phase 9 tests ---
-
 // TestGCAssistForcesMarkingWork verifies that a mutator with assist
 // debt is forced to mark grey objects before it can proceed.
 func TestGCAssistForcesMarkingWork(t *testing.T) {
@@ -513,8 +505,6 @@ func TestGCAssistIntegration(t *testing.T) {
 	t.Logf("Assist events: %d, objects marked by mutators: %d",
 		metrics.totalAssists, metrics.totalAssistWork)
 }
-
-// --- Phase 10 tests ---
 
 // TestSpanAllocation verifies that objects are placed into spans and
 // that new spans are created when existing ones fill up.
@@ -658,8 +648,6 @@ func TestInsertPlacesInSpan(t *testing.T) {
 		t.Errorf("nextID should be 43, got %d", h.nextID)
 	}
 }
-
-// --- Helpers (shared across Phase 2 and Phase 3 tests) ---
 
 func walkRoots(h *Heap, rootIDs []int) map[*Object]bool {
 	visited := make(map[*Object]bool)

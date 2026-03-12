@@ -255,8 +255,6 @@ func (m *Metrics) Summary(gogc int, duration time.Duration, numMutators int) str
 	return b.String()
 }
 
-// --- Accessors for testing ---
-
 func (m *Metrics) GCCycles() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

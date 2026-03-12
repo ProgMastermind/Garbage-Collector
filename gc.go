@@ -6,8 +6,6 @@ import (
 	"sync"
 )
 
-// --- Tri-color abstraction ---
-
 type Color int
 
 const (
@@ -29,8 +27,6 @@ func (c Color) String() string {
 	}
 }
 
-// --- Object ---
-
 type Object struct {
 	ID       int
 	Color    Color
@@ -47,19 +43,13 @@ func (o *Object) String() string {
 	return fmt.Sprintf("Object{id=%d, color=%s, children=%v}", o.ID, o.Color, childIDs)
 }
 
-// --- Span ---
-
-// SpanSize is the number of object slots per span. In real Go, spans
-// hold objects of a specific size class (8B, 16B, 32B, etc.). Our
-// simulation uses a fixed slot count since all objects are the same
-// "size." Each span has its own mutex, enabling per-span locking
-// during sweep and allocation — the key benefit over a single global lock.
+// SpanSize is the number of object slots per span (analogous to mspan
+// in real Go, but with a fixed slot count since all objects are the
+// same "size").
 const SpanSize = 8
 
-// Span represents a contiguous block of memory holding up to SpanSize
-// objects. In real Go, this is mspan — the fundamental unit of memory
-// management. Each span has its own lock so the GC can sweep one span
-// while mutators allocate from another, without either blocking.
+// Span is a contiguous block of memory holding up to SpanSize objects.
+// Each span has its own lock for concurrent sweep/allocation.
 type Span struct {
 	mu    sync.Mutex
 	ID    int
@@ -91,8 +81,6 @@ func (s *Span) freeSlot(idx int) {
 	s.Count--
 }
 
-// --- Heap ---
-
 var ErrHeapFull = errors.New("heap is full: cannot allocate")
 
 type Heap struct {
@@ -115,10 +103,7 @@ func NewHeap(maxSize int) *Heap {
 }
 
 // findFreeSpan returns a span with at least one free slot,
-// creating a new span if all existing spans are full.
-// Locks each span briefly to safely read its count — this is
-// necessary because the concurrent sweep modifies span counts
-// under span locks, not the global lock.
+// creating a new span if all existing ones are full.
 func (h *Heap) findFreeSpan() *Span {
 	for _, s := range h.Spans {
 		s.mu.Lock()
@@ -149,13 +134,8 @@ func (h *Heap) Insert(obj *Object) {
 	}
 }
 
-// Alloc creates a new object on the heap. During the mark phase, new
-// objects are born black — they have no outgoing pointers yet, so
-// marking them black is safe and avoids unnecessary barrier work.
-// Outside the mark phase, objects start white (ready for next cycle).
-//
-// The object is placed into a span with a free slot. If no span has
-// room, a new span is created automatically.
+// Alloc creates a new object on the heap. Objects born during marking
+// start black (no children to scan). Outside marking, they start white.
 func (h *Heap) Alloc() (*Object, error) {
 	if len(h.Objects) >= h.MaxSize {
 		return nil, ErrHeapFull
@@ -169,9 +149,6 @@ func (h *Heap) Alloc() (*Object, error) {
 		Color: color,
 	}
 
-	// Place the object into a span. Lock the span to safely
-	// modify its slots — the concurrent sweep may be accessing
-	// other spans simultaneously under their own locks.
 	span := h.findFreeSpan()
 	span.mu.Lock()
 	span.allocSlot(obj)
@@ -182,21 +159,9 @@ func (h *Heap) Alloc() (*Object, error) {
 	return obj, nil
 }
 
-// --- Hybrid Write Barrier ---
-
-// WriteBarrier is called on every pointer store during the mark phase.
-// It implements Go's hybrid barrier: shade BOTH the old target and the
-// new target grey. This closes two holes:
-//   - Deletion barrier (shade old): if a grey object loses its pointer to
-//     a white object, shading the old target ensures the GC still finds it.
-//   - Insertion barrier (shade new): if a black object gains a pointer to
-//     a white object, shading the new target ensures the GC still finds it.
-//
-// When the GC is not in the mark phase, this is a no-op.
-//
-// When GreyPusher is set (concurrent mode), greyed objects are pushed
-// directly onto the shared work queue — O(1) per barrier fire.
-// The GC drains this queue instead of scanning the entire heap.
+// WriteBarrier implements Go's hybrid barrier: shade both the old and
+// new targets grey on every pointer store during the mark phase.
+// No-op outside marking. Pushes greyed objects to GreyPusher if set.
 func WriteBarrier(h *Heap, old, new_ *Object) {
 	if !h.Marking {
 		return
@@ -241,8 +206,6 @@ func ReplaceChildren(h *Heap, src *Object, newChildren []*Object) {
 	}
 	src.Children = newChildren
 }
-
-// --- Mark-Sweep Collector (stop-the-world) ---
 
 // MarkSweep performs a full stop-the-world collection.
 // rootIDs identifies the set of objects directly reachable from goroutine stacks.
