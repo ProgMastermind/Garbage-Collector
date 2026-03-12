@@ -347,10 +347,7 @@ func TestStackChurnDuringGC(t *testing.T) {
 		ch.mu.Lock()
 		for _, id := range rootIDs {
 			obj := &Object{ID: id, Color: White}
-			ch.Heap.Objects[id] = obj
-			if id >= ch.Heap.nextID {
-				ch.Heap.nextID = id + 1
-			}
+			ch.Heap.Insert(obj)
 		}
 		// Seed some children.
 		for range 10 {
@@ -486,10 +483,7 @@ func TestGCAssistIntegration(t *testing.T) {
 	ch.mu.Lock()
 	for _, id := range rootIDs {
 		obj := &Object{ID: id, Color: White}
-		ch.Heap.Objects[id] = obj
-		if id >= ch.Heap.nextID {
-			ch.Heap.nextID = id + 1
-		}
+		ch.Heap.Insert(obj)
 	}
 	// Seed enough objects to create grey work.
 	for range 20 {
@@ -518,6 +512,151 @@ func TestGCAssistIntegration(t *testing.T) {
 	// timing), but verify the system doesn't crash and metrics work.
 	t.Logf("Assist events: %d, objects marked by mutators: %d",
 		metrics.totalAssists, metrics.totalAssistWork)
+}
+
+// --- Phase 10 tests ---
+
+// TestSpanAllocation verifies that objects are placed into spans and
+// that new spans are created when existing ones fill up.
+func TestSpanAllocation(t *testing.T) {
+	h := NewHeap(20)
+
+	// Allocate SpanSize objects — should fill exactly one span.
+	for range SpanSize {
+		_, err := h.Alloc()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(h.Spans) != 1 {
+		t.Errorf("expected 1 span after %d allocs, got %d", SpanSize, len(h.Spans))
+	}
+	if h.Spans[0].Count != SpanSize {
+		t.Errorf("span should have %d objects, got %d", SpanSize, h.Spans[0].Count)
+	}
+
+	// One more allocation should create a second span.
+	_, err := h.Alloc()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.Spans) != 2 {
+		t.Errorf("expected 2 spans after %d allocs, got %d", SpanSize+1, len(h.Spans))
+	}
+}
+
+// TestSpanBackPointer verifies that each object knows which span it
+// lives in and at which slot index.
+func TestSpanBackPointer(t *testing.T) {
+	h := NewHeap(10)
+
+	obj, _ := h.Alloc()
+	if obj.span == nil {
+		t.Fatal("object's span back-pointer should not be nil")
+	}
+	if obj.span.Slots[obj.slotIdx] != obj {
+		t.Error("span slot at object's slotIdx should point back to the object")
+	}
+}
+
+// TestPerSpanSweep verifies that the concurrent sweep frees span slots
+// (not just the Objects map) and that surviving objects remain in their
+// spans intact.
+func TestPerSpanSweep(t *testing.T) {
+	ch := NewConcurrentHeap(20)
+
+	ch.mu.Lock()
+	root, _ := ch.Heap.Alloc()
+	child, _ := ch.Heap.Alloc()
+	garbage1, _ := ch.Heap.Alloc()
+	garbage2, _ := ch.Heap.Alloc()
+
+	root.Children = []*Object{child}
+
+	stack := ch.RegisterStack()
+	stack.Locals = []*Object{root}
+	ch.mu.Unlock()
+
+	ConcurrentMarkSweep(ch, nil)
+
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
+	// Root and child survive.
+	if _, ok := ch.Heap.Objects[root.ID]; !ok {
+		t.Error("root should survive")
+	}
+	if _, ok := ch.Heap.Objects[child.ID]; !ok {
+		t.Error("child should survive")
+	}
+	// Root's span slot should still point to root.
+	if root.span.Slots[root.slotIdx] != root {
+		t.Error("root's span slot should still contain root after sweep")
+	}
+
+	// Garbage should be collected from both Objects map and span slots.
+	if _, ok := ch.Heap.Objects[garbage1.ID]; ok {
+		t.Error("garbage1 should be collected")
+	}
+	if _, ok := ch.Heap.Objects[garbage2.ID]; ok {
+		t.Error("garbage2 should be collected")
+	}
+	// Verify span slots are actually freed (nil).
+	if garbage1.span.Slots[garbage1.slotIdx] != nil {
+		t.Error("garbage1's span slot should be nil after sweep")
+	}
+	if garbage2.span.Slots[garbage2.slotIdx] != nil {
+		t.Error("garbage2's span slot should be nil after sweep")
+	}
+}
+
+// TestSTWMarkSweepWithSpans verifies the STW collector also frees
+// span slots correctly.
+func TestSTWMarkSweepWithSpans(t *testing.T) {
+	h := NewHeap(20)
+
+	root, _ := h.Alloc()
+	child, _ := h.Alloc()
+	garbage, _ := h.Alloc()
+
+	root.Children = []*Object{child}
+
+	MarkSweep(h, []int{root.ID})
+
+	if _, ok := h.Objects[root.ID]; !ok {
+		t.Error("root should survive STW sweep")
+	}
+	if _, ok := h.Objects[child.ID]; !ok {
+		t.Error("child should survive STW sweep")
+	}
+	if _, ok := h.Objects[garbage.ID]; ok {
+		t.Error("garbage should be collected by STW sweep")
+	}
+	// Span slot for garbage should be freed.
+	if garbage.span.Slots[garbage.slotIdx] != nil {
+		t.Error("garbage's span slot should be nil after STW sweep")
+	}
+}
+
+// TestInsertPlacesInSpan verifies that Insert puts objects into spans.
+func TestInsertPlacesInSpan(t *testing.T) {
+	h := NewHeap(10)
+
+	obj := &Object{ID: 42, Color: White}
+	h.Insert(obj)
+
+	if _, ok := h.Objects[42]; !ok {
+		t.Error("Insert should add to Objects map")
+	}
+	if obj.span == nil {
+		t.Error("Insert should place object in a span")
+	}
+	if len(h.Spans) != 1 {
+		t.Errorf("expected 1 span, got %d", len(h.Spans))
+	}
+	if h.nextID != 43 {
+		t.Errorf("nextID should be 43, got %d", h.nextID)
+	}
 }
 
 // --- Helpers (shared across Phase 2 and Phase 3 tests) ---

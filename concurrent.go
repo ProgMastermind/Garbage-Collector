@@ -201,9 +201,13 @@ func ConcurrentMarkSweepUnsafe(ch *ConcurrentHeap, rootIDs []int) {
 	}
 
 	ch.mu.Lock()
-	for id, obj := range ch.Heap.Objects {
-		if obj.Color == White {
-			delete(ch.Heap.Objects, id)
+	for _, span := range ch.Heap.Spans {
+		for i, obj := range span.Slots {
+			if obj != nil && obj.Color == White {
+				delete(ch.Heap.Objects, obj.ID)
+				span.Slots[i] = nil
+				span.Count--
+			}
 		}
 	}
 	ch.mu.Unlock()
@@ -219,6 +223,7 @@ type GCPhaseTimings struct {
 	ConcurrentSweep    time.Duration // concurrent sweep: free white objects (mutators run freely)
 	StacksScanned      int           // number of goroutine stacks scanned during STW #1
 	RootsFromStacks    int           // number of root pointers found from stack scanning
+	SpansSwept         int           // number of spans swept during concurrent sweep
 }
 
 // ConcurrentMarkSweep runs mark-sweep with the hybrid write barrier
@@ -346,11 +351,17 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
 	for _, gs := range ch.Stacks {
 		gs.AssistDebt = 0
 	}
-	// Build sweep queue: collect IDs of all white objects.
+	// Build sweep queue: collect spans that contain white objects.
+	// Unlike before (a flat list of object IDs), the sweep queue is
+	// now a list of *spans*. This enables per-span locking during
+	// the concurrent sweep — the GC locks one span at a time.
 	ch.Heap.SweepQueue = ch.Heap.SweepQueue[:0]
-	for id, obj := range ch.Heap.Objects {
-		if obj.Color == White {
-			ch.Heap.SweepQueue = append(ch.Heap.SweepQueue, id)
+	for _, span := range ch.Heap.Spans {
+		for _, obj := range span.Slots {
+			if obj != nil && obj.Color == White {
+				ch.Heap.SweepQueue = append(ch.Heap.SweepQueue, span)
+				break // one white object is enough to enqueue the span
+			}
 		}
 	}
 	ch.Heap.Sweeping = true
@@ -358,38 +369,52 @@ func ConcurrentMarkSweep(ch *ConcurrentHeap, rootIDs []int) GCPhaseTimings {
 	timings.STWMarkTermination = time.Since(stwStart)
 	// ── END STW #2 — mutators resume ─────────────────────────────
 
-	// ── CONCURRENT SWEEP ─────────────────────────────────────────
-	// Free white objects one batch at a time, releasing the lock
-	// between batches so mutators can interleave. In real Go,
-	// sweeping is even lazier: each goroutine sweeps a span before
-	// allocating from it. We sweep in small batches to approximate
-	// that behavior.
+	// ── CONCURRENT SWEEP (per-span locking) ─────────────────────
+	// Sweep one span at a time. For each span, we lock ONLY that
+	// span's mutex — not the global lock. This means mutators can
+	// allocate from other spans while one span is being swept.
+	//
+	// In real Go, sweeping is even lazier: each goroutine sweeps a
+	// span right before allocating from it. Our approach approximates
+	// that by processing spans sequentially with per-span locks.
 	sweepStart := time.Now()
-	const sweepBatchSize = 16
+	spansSwept := 0
 	for {
+		// Pop one span from the queue (brief global lock).
 		ch.mu.Lock()
-		remaining := len(ch.Heap.SweepQueue)
-		if remaining == 0 {
+		if len(ch.Heap.SweepQueue) == 0 {
 			ch.Heap.Sweeping = false
 			ch.mu.Unlock()
 			break
 		}
-		// Sweep up to sweepBatchSize objects per lock acquisition.
-		batchEnd := sweepBatchSize
-		if batchEnd > remaining {
-			batchEnd = remaining
-		}
-		batch := ch.Heap.SweepQueue[:batchEnd]
-		ch.Heap.SweepQueue = ch.Heap.SweepQueue[batchEnd:]
+		span := ch.Heap.SweepQueue[0]
+		ch.Heap.SweepQueue = ch.Heap.SweepQueue[1:]
+		ch.mu.Unlock()
 
-		for _, id := range batch {
-			if obj, ok := ch.Heap.Objects[id]; ok && obj.Color == White {
-				delete(ch.Heap.Objects, id)
+		// Lock ONLY this span — mutators can work with other spans.
+		span.mu.Lock()
+		var deadIDs []int
+		for i, obj := range span.Slots {
+			if obj != nil && obj.Color == White {
+				deadIDs = append(deadIDs, obj.ID)
+				span.Slots[i] = nil
+				span.Count--
 			}
 		}
-		ch.mu.Unlock()
+		span.mu.Unlock()
+
+		// Brief global lock to update the Objects index.
+		if len(deadIDs) > 0 {
+			ch.mu.Lock()
+			for _, id := range deadIDs {
+				delete(ch.Heap.Objects, id)
+			}
+			ch.mu.Unlock()
+		}
+		spansSwept++
 	}
 	timings.ConcurrentSweep = time.Since(sweepStart)
+	timings.SpansSwept = spansSwept
 	// ── END CONCURRENT SWEEP ─────────────────────────────────────
 
 	return timings

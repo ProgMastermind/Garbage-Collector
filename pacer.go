@@ -85,14 +85,11 @@ func RunWithPacer(
 	pacer := NewPacer(gogc)
 	metrics := NewMetrics(heapSize)
 
-	// Pre-create root objects.
+	// Pre-create root objects (placed into spans via Insert).
 	ch.mu.Lock()
 	for _, id := range rootIDs {
 		obj := &Object{ID: id, Color: White}
-		ch.Heap.Objects[id] = obj
-		if id >= ch.Heap.nextID {
-			ch.Heap.nextID = id + 1
-		}
+		ch.Heap.Insert(obj)
 	}
 	ch.mu.Unlock()
 
@@ -135,6 +132,7 @@ func RunWithPacer(
 
 			ch.mu.Lock()
 			after := len(ch.Heap.Objects)
+			spanCount := len(ch.Heap.Spans)
 			ch.mu.Unlock()
 
 			collected := before - after
@@ -155,6 +153,7 @@ func RunWithPacer(
 			}
 			allStats = append(allStats, stats)
 			metrics.RecordStackScan(timings.StacksScanned, timings.RootsFromStacks)
+			metrics.RecordSpanInfo(spanCount, timings.SpansSwept)
 			metrics.RecordGCCycle(stats)
 
 			if printStats {

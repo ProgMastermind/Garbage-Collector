@@ -32,6 +32,10 @@ type Metrics struct {
 	totalAssists    int64 // total number of assist events (mutator had to help)
 	totalAssistWork int64 // total grey objects marked by mutators via assist
 
+	// Span stats
+	peakSpanCount int // max number of spans seen
+	spansSwept    int // total spans swept across all cycles
+
 	// Heap stats
 	peakHeapSize int // max heap occupancy seen
 	heapCapacity int // max allowed objects
@@ -54,6 +58,16 @@ func NewMetrics(heapCapacity int) *Metrics {
 // RecordAllocation is called by mutators after each successful Alloc.
 func (m *Metrics) RecordAllocation() {
 	m.totalAllocated.Add(1)
+}
+
+// RecordSpanInfo records span statistics after a GC cycle.
+func (m *Metrics) RecordSpanInfo(spanCount, spansSwept int) {
+	m.mu.Lock()
+	if spanCount > m.peakSpanCount {
+		m.peakSpanCount = spanCount
+	}
+	m.spansSwept += spansSwept
+	m.mu.Unlock()
 }
 
 // RecordAssist is called by a mutator when it was forced to do
@@ -213,6 +227,18 @@ func (m *Metrics) Summary(gogc int, duration time.Duration, numMutators int) str
 			utilPct, m.lastHeapSize, m.heapCapacity))
 	}
 	b.WriteString("\n")
+
+	// Spans
+	if m.peakSpanCount > 0 {
+		b.WriteString("  Spans\n")
+		b.WriteString(fmt.Sprintf("    Peak span count : %d (×%d slots = %d capacity)\n",
+			m.peakSpanCount, SpanSize, m.peakSpanCount*SpanSize))
+		b.WriteString(fmt.Sprintf("    Spans swept     : %d (across %d cycles)\n", m.spansSwept, m.gcCycles))
+		if m.gcCycles > 0 {
+			b.WriteString(fmt.Sprintf("    Avg swept/cycle : %d spans\n", m.spansSwept/m.gcCycles))
+		}
+		b.WriteString("\n")
+	}
 
 	// Objects
 	alloc := m.totalAllocated.Load()

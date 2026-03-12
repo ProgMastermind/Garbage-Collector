@@ -3,6 +3,7 @@ package gc
 import (
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // --- Tri-color abstraction ---
@@ -34,6 +35,8 @@ type Object struct {
 	ID       int
 	Color    Color
 	Children []*Object // Pointers to other heap objects
+	span     *Span     // which span this object lives in
+	slotIdx  int       // index within the span's Slots array
 }
 
 func (o *Object) String() string {
@@ -44,18 +47,64 @@ func (o *Object) String() string {
 	return fmt.Sprintf("Object{id=%d, color=%s, children=%v}", o.ID, o.Color, childIDs)
 }
 
+// --- Span ---
+
+// SpanSize is the number of object slots per span. In real Go, spans
+// hold objects of a specific size class (8B, 16B, 32B, etc.). Our
+// simulation uses a fixed slot count since all objects are the same
+// "size." Each span has its own mutex, enabling per-span locking
+// during sweep and allocation — the key benefit over a single global lock.
+const SpanSize = 8
+
+// Span represents a contiguous block of memory holding up to SpanSize
+// objects. In real Go, this is mspan — the fundamental unit of memory
+// management. Each span has its own lock so the GC can sweep one span
+// while mutators allocate from another, without either blocking.
+type Span struct {
+	mu    sync.Mutex
+	ID    int
+	Slots [SpanSize]*Object // nil slots are free
+	Count int               // number of occupied slots
+}
+
+func (s *Span) isFull() bool {
+	return s.Count >= SpanSize
+}
+
+// allocSlot places obj into the first free slot of this span.
+// Sets the object's back-pointer to this span.
+func (s *Span) allocSlot(obj *Object) {
+	for i := range s.Slots {
+		if s.Slots[i] == nil {
+			s.Slots[i] = obj
+			s.Count++
+			obj.span = s
+			obj.slotIdx = i
+			return
+		}
+	}
+}
+
+// freeSlot removes the object at the given slot index.
+func (s *Span) freeSlot(idx int) {
+	s.Slots[idx] = nil
+	s.Count--
+}
+
 // --- Heap ---
 
 var ErrHeapFull = errors.New("heap is full: cannot allocate")
 
 type Heap struct {
 	MaxSize    int
-	Objects    map[int]*Object // Live objects indexed by ID
+	Objects    map[int]*Object   // Global index: object ID → object (for fast lookup)
+	Spans      []*Span           // All spans in the heap
 	nextID     int
-	Marking    bool               // True while the GC is in the mark phase
-	Sweeping   bool               // True while concurrent sweep is in progress
-	SweepQueue []int              // IDs of white objects to sweep (populated at mark termination)
-	GreyPusher func(obj *Object)  // If set, called to push grey objects to the shared work queue
+	nextSpanID int
+	Marking    bool              // True while the GC is in the mark phase
+	Sweeping   bool              // True while concurrent sweep is in progress
+	SweepQueue []*Span           // Spans containing white objects to sweep
+	GreyPusher func(obj *Object) // If set, called to push grey objects to the shared work queue
 }
 
 func NewHeap(maxSize int) *Heap {
@@ -65,10 +114,48 @@ func NewHeap(maxSize int) *Heap {
 	}
 }
 
+// findFreeSpan returns a span with at least one free slot,
+// creating a new span if all existing spans are full.
+// Locks each span briefly to safely read its count — this is
+// necessary because the concurrent sweep modifies span counts
+// under span locks, not the global lock.
+func (h *Heap) findFreeSpan() *Span {
+	for _, s := range h.Spans {
+		s.mu.Lock()
+		full := s.isFull()
+		if !full {
+			s.mu.Unlock()
+			return s
+		}
+		s.mu.Unlock()
+	}
+	// All spans full — create a new one.
+	s := &Span{ID: h.nextSpanID}
+	h.nextSpanID++
+	h.Spans = append(h.Spans, s)
+	return s
+}
+
+// Insert places an existing object into the heap (Objects map + span).
+// Used for manually creating root objects with specific IDs.
+func (h *Heap) Insert(obj *Object) {
+	h.Objects[obj.ID] = obj
+	span := h.findFreeSpan()
+	span.mu.Lock()
+	span.allocSlot(obj)
+	span.mu.Unlock()
+	if obj.ID >= h.nextID {
+		h.nextID = obj.ID + 1
+	}
+}
+
 // Alloc creates a new object on the heap. During the mark phase, new
 // objects are born black — they have no outgoing pointers yet, so
 // marking them black is safe and avoids unnecessary barrier work.
 // Outside the mark phase, objects start white (ready for next cycle).
+//
+// The object is placed into a span with a free slot. If no span has
+// room, a new span is created automatically.
 func (h *Heap) Alloc() (*Object, error) {
 	if len(h.Objects) >= h.MaxSize {
 		return nil, ErrHeapFull
@@ -81,6 +168,15 @@ func (h *Heap) Alloc() (*Object, error) {
 		ID:    h.nextID,
 		Color: color,
 	}
+
+	// Place the object into a span. Lock the span to safely
+	// modify its slots — the concurrent sweep may be accessing
+	// other spans simultaneously under their own locks.
+	span := h.findFreeSpan()
+	span.mu.Lock()
+	span.allocSlot(obj)
+	span.mu.Unlock()
+
 	h.Objects[obj.ID] = obj
 	h.nextID++
 	return obj, nil
@@ -184,9 +280,14 @@ func MarkSweep(heap *Heap, rootIDs []int) {
 	}
 
 	// Phase 4: Sweep — free every object still white (unreachable).
-	for id, obj := range heap.Objects {
-		if obj.Color == White {
-			delete(heap.Objects, id)
+	// Walk spans and free slots, then remove from the global index.
+	for _, span := range heap.Spans {
+		for i, obj := range span.Slots {
+			if obj != nil && obj.Color == White {
+				delete(heap.Objects, obj.ID)
+				span.Slots[i] = nil
+				span.Count--
+			}
 		}
 	}
 }
